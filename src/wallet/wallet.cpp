@@ -2706,7 +2706,7 @@ bool CWallet::CreateCoinStake(
 
     // Add dev fund output
     if (nHeight > consensus.height_supply_reduction) {
-        CTxDestination dest = DecodeDestination(Params().DevFundAddress(pindexPrev->nHeight + 1));
+        CTxDestination dest = DecodeDestination(Params().DevFundAddress());
         CAmount defFundPayment = GetBlockDevSubsidy(pindexPrev->nHeight + 1);
         CScript devScriptPubKey = GetScriptForDestination(dest);
 
@@ -2765,22 +2765,28 @@ bool CWallet::CreateCoinStake(
             LogPrintf("%s : failed to create output\n", __func__);
             continue;
         }
+
         txNew.vout.insert(txNew.vout.end(), vout.begin(), vout.end());
 
+        int keyIndex = nHeight > consensus.height_supply_reduction ? 2 : 1;
+
         // Set output amount
-        int outputs = (int) txNew.vout.size() - 2;
+        int outputs = (int) txNew.vout.size() - keyIndex;
         CAmount nRemaining = nCredit;
-        if (outputs > 1) {
+
+        if (outputs > keyIndex) {
             // Split the stake across the outputs
             CAmount nShare = nRemaining / outputs;
-            for (int i = 2; i < outputs; i++) {
+
+            for (int i = keyIndex; i < (txNew.vout.size() - 1); i++) {
                 // loop through all but the last one.
                 txNew.vout[i].nValue = nShare;
                 nRemaining -= nShare;
             }
         }
+
         // put the remaining on the last output (which all into the first if only one output)
-        txNew.vout[outputs + 1].nValue += nRemaining;
+        txNew.vout[txNew.vout.size() - 1].nValue += nRemaining;
 
         // Limit size
         unsigned int nBytes = ::GetSerializeSize(txNew, SER_NETWORK, PROTOCOL_VERSION);

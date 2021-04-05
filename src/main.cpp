@@ -1214,212 +1214,6 @@ bool GetAddressUnspent(uint160 addressHash, int type,
     return true;
 }
 
-bool AcceptableInputs(CTxMemPool& pool, CValidationState& state, const CTransaction& tx, bool fLimitFree, bool* pfMissingInputs, bool fRejectInsaneFee, bool isDSTX)
-{
-    AssertLockHeld(cs_main);
-    if (pfMissingInputs)
-        *pfMissingInputs = false;
-
-    const int chainHeight = chainActive.Height();
-    const Consensus::Params& consensus = Params().GetConsensus();
-
-    if (!CheckTransaction(tx, consensus.NetworkUpgradeActive(chainHeight, Consensus::UPGRADE_ZC), true, state))
-        return error("%s : transaction checks for %s failed with %s", __func__, tx.GetHash().ToString(), FormatStateMessage(state));
-
-    // Coinbase is only valid in a block, not as a loose transaction
-    if (tx.IsCoinBase())
-        return state.DoS(100, error("AcceptableInputs: : coinbase as individual tx"),
-            REJECT_INVALID, "coinbase");
-
-    // is it already in the memory pool?
-    uint256 hash = tx.GetHash();
-    if (pool.exists(hash))
-        return false;
-
-    // ----------- swiftTX transaction scanning -----------
-    std::string reason;
-    for (const CTxIn& in : tx.vin) {
-        if (mapLockedInputs.count(in.prevout)) {
-            if (mapLockedInputs[in.prevout] != tx.GetHash()) {
-                return state.DoS(0,
-                    error("AcceptableInputs : conflicts with existing transaction lock: %s", reason),
-                    REJECT_INVALID, "tx-lock-conflict");
-            }
-        }
-    }
-
-    // Check for conflicts with in-memory transactions
-    if (!tx.HasZerocoinSpendInputs()) {
-        LOCK(pool.cs); // protect pool.mapNextTx
-        for (const auto &in : tx.vin) {
-            COutPoint outpoint = in.prevout;
-            if (pool.mapNextTx.count(outpoint)) {
-                // Disable replacement feature for now
-                return false;
-            }
-        }
-    }
-
-
-    {
-        CCoinsView dummy;
-        CCoinsViewCache view(&dummy);
-
-        CAmount nValueIn = 0;
-        {
-            LOCK(pool.cs);
-            CCoinsViewMemPool viewMemPool(pcoinsTip, pool);
-            view.SetBackend(viewMemPool);
-
-            // do we already have it?
-            for (size_t out = 0; out < tx.vout.size(); out++) {
-                COutPoint outpoint(hash, out);
-                if (view.HaveCoin(outpoint)) {
-                    return state.Invalid(false, REJECT_ALREADY_KNOWN, "txn-already-known");
-                }
-            }
-
-            // do all inputs exist?
-            for (const CTxIn& txin : tx.vin) {
-                if (!view.HaveCoin(txin.prevout)) {
-                    if (pfMissingInputs) {
-                        *pfMissingInputs = true;
-                    }
-                    return false; // fMissingInputs and !state.IsInvalid() is used to detect this condition, don't set state.Invalid()
-                }
-
-                //Check for invalid/fraudulent inputs
-                if (!ValidOutPoint(txin.prevout, chainHeight))
-                    return state.Invalid(false, REJECT_INVALID, "bad-txns-invalid-inputs");
-            }
-
-            // Bring the best block into scope
-            view.GetBestBlock();
-
-            nValueIn = view.GetValueIn(tx, chainHeight);
-
-            // we have all inputs cached now, so switch back to dummy, so we don't need to keep lock on mempool
-            view.SetBackend(dummy);
-        }
-
-        // Check that the transaction doesn't have an excessive number of
-        // sigops, making it impossible to mine. Since the coinbase transaction
-        // itself can contain sigops MAX_TX_SIGOPS is less than
-        // MAX_BLOCK_SIGOPS; we still consider this an invalid rather than
-        // merely non-standard transaction.
-        unsigned int nSigOps = GetLegacySigOpCount(tx);
-        unsigned int nMaxSigOps = MAX_TX_SIGOPS_CURRENT;
-        nSigOps += GetP2SHSigOpCount(tx, view);
-        if (nSigOps > nMaxSigOps)
-            return state.DoS(0,
-                error("AcceptableInputs : too many sigops %s, %d > %d",
-                    hash.ToString(), nSigOps, nMaxSigOps),
-                REJECT_NONSTANDARD, "bad-txns-too-many-sigops");
-
-        CAmount nValueOut = tx.GetValueOut();
-        CAmount nFees = nValueIn - nValueOut;
-        CAmount inChainInputValue;
-        double dPriority = view.GetPriority(tx, chainHeight, inChainInputValue);
-
-        // Keep track of transactions that spend a coinbase, which we re-scan
-        // during reorgs to ensure COINBASE_MATURITY is still met.
-        bool fSpendsCoinbaseOrCoinstake = false;
-        for (const CTxIn &txin : tx.vin) {
-            const Coin& coin = view.AccessCoin(txin.prevout);
-            if (coin.IsCoinBase() || coin.IsCoinStake()) {
-                fSpendsCoinbaseOrCoinstake = true;
-                break;
-            }
-        }
-        CTxMemPoolEntry entry(tx, nFees, GetTime(), dPriority, chainHeight, mempool.HasNoInputsOf(tx), inChainInputValue, fSpendsCoinbaseOrCoinstake, nSigOps);
-        unsigned int nSize = entry.GetTxSize();
-
-        // Don't accept it if it can't get into a block
-        // but prioritise dstx and don't check fees for it
-        if (isDSTX) {
-            mempool.PrioritiseTransaction(hash, hash.ToString(), 1000, 0.1 * COIN);
-        } else { // same as !ignoreFees for AcceptToMemoryPool
-            CAmount txMinFee = GetMinRelayFee(tx, pool, nSize, true);
-            if (fLimitFree && nFees < txMinFee && !tx.HasZerocoinSpendInputs())
-                return state.DoS(0, error("AcceptableInputs : not enough fees %s, %d < %d", hash.ToString(), nFees, txMinFee),
-                    REJECT_INSUFFICIENTFEE, "insufficient fee");
-
-            // Require that free transactions have sufficient priority to be mined in the next block.
-            CAmount mempoolRejectFee = pool.GetMinFee(GetArg("-maxmempool", DEFAULT_MAX_MEMPOOL_SIZE) * 1000000).GetFee(nSize);
-            if (mempoolRejectFee > 0 && nFees < mempoolRejectFee) {
-                return state.DoS(0, error("%s : insuffiecient fee: %d < %d",
-                        __func__, nFees, mempoolRejectFee), REJECT_INSUFFICIENTFEE, "mempool min fee not met", false);
-            } else if (GetBoolArg("-relaypriority", DEFAULT_RELAYPRIORITY) && nFees < ::minRelayTxFee.GetFee(nSize) && !AllowFree(entry.GetPriority(chainActive.Height() + 1))) {
-                // Require that free transactions have sufficient priority to be mined in the next block.
-                return state.DoS(0, false, REJECT_INSUFFICIENTFEE, "insufficient priority");
-            }
-
-            // Continuously rate-limit free (really, very-low-fee) transactions
-            // This mitigates 'penny-flooding' -- sending thousands of free transactions just to
-            // be annoying or make others' transactions take longer to confirm.
-            if (fLimitFree && nFees < ::minRelayTxFee.GetFee(nSize) && !tx.HasZerocoinSpendInputs()) {
-                static RecursiveMutex csFreeLimiter;
-                static double dFreeCount;
-                static int64_t nLastTime;
-                int64_t nNow = GetTime();
-
-                LOCK(csFreeLimiter);
-
-                // Use an exponentially decaying ~10-minute window:
-                dFreeCount *= pow(1.0 - 1.0 / 600.0, (double)(nNow - nLastTime));
-                nLastTime = nNow;
-                // -limitfreerelay unit is thousand-bytes-per-minute
-                // At default rate it would take over a month to fill 1GB
-                if (dFreeCount >= GetArg("-limitfreerelay", DEFAULT_LIMITFREERELAY) * 10 * 1000)
-                    return state.DoS(0, error("AcceptableInputs : free transaction rejected by rate limiter"),
-                        REJECT_INSUFFICIENTFEE, "rate limited free transaction");
-                LogPrint(BCLog::MEMPOOL, "Rate limit dFreeCount: %g => %g\n", dFreeCount, dFreeCount + nSize);
-                dFreeCount += nSize;
-            }
-        }
-
-        if (fRejectInsaneFee && nFees > ::minRelayTxFee.GetFee(nSize) * 10000)
-            return error("AcceptableInputs: : insane fees %s, %d > %d",
-                hash.ToString(),
-                nFees, ::minRelayTxFee.GetFee(nSize) * 10000);
-
-        bool fCLTVIsActivated = consensus.NetworkUpgradeActive(chainActive.Tip()->nHeight, Consensus::UPGRADE_BIP65);
-
-        // Check against previous transactions
-        // This is done last to help prevent CPU exhaustion denial-of-service attacks.
-        int flags = STANDARD_SCRIPT_VERIFY_FLAGS;
-        if (fCLTVIsActivated)
-            flags |= SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY;
-
-        PrecomputedTransactionData precomTxData(tx);
-        if (!CheckInputs(tx, state, view, false, flags, true, precomTxData)) {
-            return error("AcceptableInputs: : ConnectInputs failed %s", hash.ToString());
-        }
-
-        // Check again against just the consensus-critical mandatory script
-        // verification flags, in case of bugs in the standard flags that cause
-        // transactions to pass as valid when they're actually invalid. For
-        // instance the STRICTENC flag was incorrectly allowing certain
-        // CHECKSIG NOT scripts to pass, even though they were invalid.
-        //
-        // There is a similar check in CreateNewBlock() to prevent creating
-        // invalid blocks, however allowing such transactions into the mempool
-        // can be exploited as a DoS attack.
-        // for any real tx this will be checked on AcceptToMemoryPool anyway
-        //        if (!CheckInputs(tx, state, view, false, MANDATORY_SCRIPT_VERIFY_FLAGS, true, precomTxData))
-        //        {
-        //            return error("AcceptableInputs: : BUG! PLEASE REPORT THIS! ConnectInputs failed against MANDATORY but not STANDARD flags %s", hash.ToString());
-        //        }
-
-        // Store transaction in memory
-        // pool.addUnchecked(hash, entry);
-    }
-
-    // SyncWithWallets(tx, NULL);
-
-    return true;
-}
-
 bool GetOutput(const uint256& hash, unsigned int index, CValidationState& state, CTxOut& out)
 {
     CTransaction txPrev;
@@ -1643,7 +1437,7 @@ CAmount GetBlockDevSubsidy(int nHeight)
     CAmount reward = GetBlockValue(nHeight);
 
     if (nHeight <= Params().GetConsensus().height_supply_reduction)
-        return reward;
+        return 0;
 
     return reward * 0.2;
 }
@@ -1656,6 +1450,16 @@ CAmount GetBlockStakeSubsidy(int nHeight)
         return reward;
 
     return reward * 0.2;
+}
+
+CAmount GetBlockMasternodeSubsidy(int nHeight)
+{
+    CAmount reward = GetBlockValue(nHeight);
+
+    if (nHeight <= Params().GetConsensus().height_supply_reduction)
+        return GetMasternodePayment(nHeight, reward);
+
+    return reward * 0.6;
 }
 
 bool IsBurnBlock(int nHeight)
@@ -2720,7 +2524,7 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
 
     // Dev fund checks
     if (nHeight > consensus.height_supply_reduction) {
-        CTxDestination dest = DecodeDestination(Params().DevFundAddress(nHeight));
+        CTxDestination dest = DecodeDestination(Params().DevFundAddress());
         CScript devScriptPubKey = GetScriptForDestination(dest);
 
         if (block.vtx[1].vout[1].scriptPubKey != devScriptPubKey)
@@ -3088,6 +2892,14 @@ bool static DisconnectTip(CValidationState& state)
     // UpdateTransactionsFromBlock finds descendants of any transactions in this
     // block that were added back and cleans up the mempool state.
     mempool.UpdateTransactionsFromBlock(vHashUpdate);
+    // Update MN manager cache
+    // replace the cached hash of pindexDelete with the hash of the block
+    // at depth CACHED_BLOCK_HASHES if it exists, or empty hash otherwise.
+    if ((unsigned) pindexDelete->nHeight >= CACHED_BLOCK_HASHES) {
+        mnodeman.CacheBlockHash(chainActive[pindexDelete->nHeight - CACHED_BLOCK_HASHES]);
+    } else {
+        mnodeman.UncacheBlockHash(pindexDelete);
+    }
     // Update chainActive and related variables.
     UpdateTip(pindexDelete->pprev);
     // Let wallets know transactions went from 1-confirmed to
@@ -3161,6 +2973,9 @@ bool static ConnectTip(CValidationState& state, CBlockIndex* pindexNew, const CB
     mempool.removeForBlock(pblock->vtx, pindexNew->nHeight, txConflicted, !IsInitialBlockDownload());
     // Update chainActive & related variables.
     UpdateTip(pindexNew);
+    // Update MN manager cache
+    mnodeman.CacheBlockHash(pindexNew);
+    mnodeman.CheckSpentCollaterals(pblock->vtx);
 
     for(unsigned int i=0; i < pblock->vtx.size(); i++) {
         txChanged.emplace_back(pblock->vtx[i], pindexNew, i);
@@ -3729,10 +3544,13 @@ bool CheckColdStakeFreeOutput(const CTransaction& tx, const int nHeight)
         return true;
 
     const unsigned int outs = tx.vout.size();
-    const CTxOut& lastOut = tx.vout[outs-1];
-    if (outs >= 3 && lastOut.scriptPubKey != tx.vout[outs-2].scriptPubKey) {
-        CAmount blockValue = GetBlockValue(nHeight);
-        CAmount masternodePayment = GetMasternodePayment(nHeight, blockValue);
+    const CTxOut& lastOut = tx.vout[outs - 1];
+
+    const Consensus::Params& consensus = Params().GetConsensus();
+    int keyIndex = nHeight > consensus.height_supply_reduction ? 4 : 3;
+
+    if (outs >= keyIndex && lastOut.scriptPubKey != tx.vout[outs - 2].scriptPubKey) {
+        CAmount masternodePayment = GetBlockMasternodeSubsidy(nHeight);
 
         if (lastOut.nValue == masternodePayment)
             return true;
@@ -3750,7 +3568,7 @@ bool CheckColdStakeFreeOutput(const CTransaction& tx, const int nHeight)
                 return error("%s : read txPrev failed: %s",  __func__, tx.vin[0].prevout.hash.GetHex());
             CAmount amtIn = txPrev.vout[tx.vin[0].prevout.n].nValue + GetBlockValue(nHeight - 1);
             CAmount amtOut = 0;
-            for (unsigned int i = 1; i < outs-1; i++) amtOut += tx.vout[i].nValue;
+            for (unsigned int i = 1; i < outs - 1; i++) amtOut += tx.vout[i].nValue;
             if (amtOut != amtIn)
                 return error("%s: non-free outputs value %d less than required %d", __func__, amtOut, amtIn);
             return true;
@@ -3766,7 +3584,7 @@ bool CheckColdStakeFreeOutput(const CTransaction& tx, const int nHeight)
 
         // wrong free output
         return error("%s: Wrong cold staking outputs: vout[%d].scriptPubKey (%s) != vout[%d].scriptPubKey (%s) - value: %s",
-                __func__, outs-1, HexStr(lastOut.scriptPubKey), outs-2, HexStr(tx.vout[outs-2].scriptPubKey), FormatMoney(lastOut.nValue).c_str());
+                __func__, outs - 1, HexStr(lastOut.scriptPubKey), outs - 2, HexStr(tx.vout[outs - 2].scriptPubKey), FormatMoney(lastOut.nValue).c_str());
     }
 
     return true;
@@ -4511,6 +4329,7 @@ bool ProcessNewBlock(CValidationState& state, CNode* pfrom, const CBlock* pblock
         return error("%s : ActivateBestChain failed", __func__);
 
     if (!fLiteMode) {
+        mnodeman.SetBestHeight(newHeight);
         budget.NewBlock(newHeight);
         if (masternodeSync.RequestedMasternodeAssets > MASTERNODE_SYNC_LIST) {
             masternodePayments.ProcessBlock(newHeight + 10);

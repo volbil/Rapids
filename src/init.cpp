@@ -940,6 +940,19 @@ static std::string ResolveErrMsg(const char * const optname, const std::string& 
     return strprintf(_("Cannot resolve -%s address: '%s'"), optname, strBind);
 }
 
+// Sets the last CACHED_BLOCK_HASHES hashes into masternode manager cache
+static void LoadBlockHashesCache(CMasternodeMan& man)
+{
+    LOCK(cs_main);
+    const CBlockIndex* pindex = chainActive.Tip();
+    unsigned int inserted = 0;
+    while (pindex && inserted < CACHED_BLOCK_HASHES) {
+        man.CacheBlockHash(pindex);
+        pindex = pindex->pprev;
+        ++inserted;
+    }
+}
+
 void InitLogging()
 {
     //g_logger->m_print_to_file = !IsArgNegated("-debuglogfile");
@@ -1749,10 +1762,15 @@ bool AppInit2()
         uiInterface.NotifyBlockTip.disconnect(BlockNotifyGenesisWait);
     }
 
+    int nChainHeight = WITH_LOCK(cs_main, return chainActive.Height(); );
+
     // ********************************************************* Step 10: setup layer 2 data
 
     uiInterface.InitMessage(_("Loading masternode cache..."));
 
+    mnodeman.SetBestHeight(nChainHeight);
+
+    LoadBlockHashesCache(mnodeman);
     CMasternodeDB mndb;
     CMasternodeDB::ReadResult readResult = mndb.Read(mnodeman);
     if (readResult == CMasternodeDB::FileError)
@@ -1768,7 +1786,6 @@ bool AppInit2()
     uiInterface.InitMessage(_("Loading budget cache..."));
 
     CBudgetDB budgetdb;
-    int nChainHeight = WITH_LOCK(cs_main, return chainActive.Height(); );
     const bool fDryRun = (nChainHeight <= 0);
     CBudgetDB::ReadResult readResult2 = budgetdb.Read(budget, fDryRun);
     if (nChainHeight > 0)
